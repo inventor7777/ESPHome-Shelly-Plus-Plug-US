@@ -1,0 +1,11 @@
+# PlugUS 1.7.5 / SNPL-00116US, copied from the official partition table.
+# Keep this layout for the first ESPHome build; migrate only after ESPHome boots.
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x009000, 0x004000,
+otadata,  data, ota,     0x00d000, 0x002000,
+app_0,    app,  ota_0,   0x010000, 0x190000,
+fs_0,     data, 0x82,    0x1a0000, 0x060000,
+app_1,    app,  ota_1,   0x200000, 0x190000,
+fs_1,     data, 0x82,    0x390000, 0x060000,
+aux,      0x55, 0x00,    0x3f0000, 0x00c000,
+shelly,   data, 0x88,    0x3fc000, 0x004000,

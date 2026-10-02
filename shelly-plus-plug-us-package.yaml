@@ -1,0 +1,1009 @@
+esphome:
+  on_boot:
+    priority: 600
+    then:
+      - if:
+          condition:
+            lambda: |-
+              const auto behavior = id(power_on_behavior).current_option();
+              return behavior == "Always On" || (behavior == "Restore Last State" && id(outlet_last_state));
+          then:
+            - switch.turn_on: outlet
+
+# GPIO assignments recovered from Shelly PlugUS 1.7.5 firmware.
+# Calibrated against a 119.65 V outlet and an incandescent load measured by a
+# Third Reality plug: 0.87 A and 102.5 W.
+# Verify NTC accuracy before relying on its thermal cutoff.
+  
+esp32:
+  variant: ESP32
+  flash_size: 4MB
+  flash_mode: dio
+  flash_frequency: 80MHz
+  cpu_frequency: 160MHz
+  partitions: shelly-plug-us-stock.csv
+  framework:
+    type: esp-idf
+
+substitutions:
+  voltage_divider: "2121.4"
+  # 0.0012184 * (0.88 A / 0.90 A)
+  current_resistor: "0.0011913"
+  # 1.094 * (108 W / 102 W)
+  power_calibration: "1.1584"
+
+# Retain the lifetime energy total in ESP32 NVS. Changes are coalesced before
+# flash writes to limit wear; a sudden loss of power can lose up to 5 minutes.
+preferences:
+  flash_write_interval: 5min
+
+globals:
+  - id: lifetime_energy_kwh
+    type: double
+    restore_value: true
+    initial_value: '0.0'
+  - id: energy_since_boot_wh
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: lifetime_relay_on_seconds
+    type: uint64_t
+    restore_value: true
+    initial_value: '0'
+  - id: relay_on_started_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: relay_on_timer_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: outlet_last_state
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: lifetime_relay_cycles_count
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: lifetime_button_presses_count
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: peak_power_w
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+  - id: peak_current_a
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+  - id: peak_voltage_v
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+  - id: minimum_voltage_v
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+  - id: peak_internal_temperature_c
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+  - id: overcurrent_trips_count
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: overvoltage_trips_count
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: undervoltage_trips_count
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: overpower_trips_count
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: overtemperature_trips_count
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: last_trip_reason_value
+    type: std::string
+    restore_value: true
+    initial_value: '"None"'
+  - id: overcurrent_fault
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: overvoltage_fault
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: undervoltage_fault
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: overpower_fault
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: overheating_fault
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: protection_shutdown
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+script:
+  - id: record_trip
+    parameters:
+      reason: string
+      value: float
+      unit: string
+    then:
+      - lambda: |-
+          auto now = id(sntp_time).now();
+          char record[96];
+          if (now.is_valid()) {
+            snprintf(record, sizeof(record), "%04d-%02d-%02dT%02d:%02d:%02d %s: %.2f %s", now.year, now.month, now.day_of_month, now.hour, now.minute, now.second, reason.c_str(), value, unit.c_str());
+          } else {
+            snprintf(record, sizeof(record), "Unknown time %s: %.2f %s", reason.c_str(), value, unit.c_str());
+          }
+          id(last_trip_reason_value) = record;
+          id(last_trip_reason).publish_state(record);
+  - id: automatic_fault_reset
+    mode: restart
+    then:
+      - delay: !lambda return (uint32_t) (id(fault_reset_delay).state * 60000.0f);
+      - if:
+          condition:
+            lambda: return id(automatic_fault_reset_enabled).state && !id(outlet).state && (id(overcurrent_fault) || id(overvoltage_fault) || id(undervoltage_fault) || id(overpower_fault) || id(overheating_fault));
+          then:
+            - switch.turn_on: outlet
+  - id: auto_off_countdown
+    mode: restart
+    then:
+      - delay: !lambda return (uint32_t) (id(auto_off_delay).state * 60000.0f);
+      - if:
+          condition:
+            lambda: return id(auto_off_timer).state && id(outlet).state;
+          then:
+            - switch.turn_off: outlet
+  - id: button_lock_feedback
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: return !(id(overcurrent_fault) || id(overvoltage_fault) || id(undervoltage_fault) || id(overpower_fault) || id(overheating_fault));
+          then:
+            - delay: 250ms 
+            - light.turn_on:
+                id: red_led
+                brightness: 100%
+            - delay: 250ms
+            - light.turn_off: red_led
+            - delay: 250ms
+            - light.turn_on:
+                id: red_led
+                brightness: 100%
+            - delay: 250ms
+            - light.turn_off: red_led
+  - id: update_power_factor
+    then:
+      - lambda: |-
+          const float apparent_va = id(outlet_voltage).get_raw_state() * id(outlet_current).get_raw_state();
+          if (apparent_va <= 0.0f) {
+            id(apparent_power).publish_state(NAN);
+            id(power_factor).publish_state(NAN);
+            return;
+          }
+          id(apparent_power).publish_state(apparent_va);
+          const float measured_power_factor = (id(outlet_power).get_raw_state() * ${power_calibration}) / apparent_va;
+          id(power_factor).publish_state(measured_power_factor > 1.0f ? 1.0f : measured_power_factor);
+  - id: update_status_led
+    mode: restart
+    then:
+      - if:
+          condition:
+            not:
+              script.is_running: button_lock_feedback
+          then:
+            - if:
+                condition:
+                  lambda: return id(overcurrent_fault) || id(overvoltage_fault) || id(undervoltage_fault) || id(overpower_fault) || id(overheating_fault);
+                then:
+                  - if:
+                      condition:
+                        lambda: return !id(red_led).remote_values.is_on();
+                      then:
+                        - light.turn_on:
+                            id: red_led
+                            brightness: 100%
+                  - if:
+                      condition:
+                        lambda: return id(blue_led).remote_values.is_on();
+                      then:
+                        - light.turn_off: blue_led
+                else:
+                  - if:
+                      condition:
+                        lambda: return id(led_enabled).state && (id(outlet).state || id(standby_led).state);
+                      then:
+                        - if:
+                            condition:
+                              lambda: return id(red_led).remote_values.is_on();
+                            then:
+                              - light.turn_off: red_led
+                        - if:
+                            condition:
+                              lambda: |-
+                                const float target = id(outlet).state ? id(blue_led_brightness).state / 100.0f : id(standby_led_brightness).state / 100.0f;
+                                const float difference = id(blue_led).remote_values.get_brightness() - target;
+                                return !id(blue_led).remote_values.is_on() || difference > 0.005f || difference < -0.005f;
+                            then:
+                              - light.turn_on:
+                                  id: blue_led
+                                  brightness: !lambda |-
+                                    return id(outlet).state ? id(blue_led_brightness).state / 100.0f : id(standby_led_brightness).state / 100.0f;
+                      else:
+                        - if:
+                            condition:
+                              lambda: return id(red_led).remote_values.is_on();
+                            then:
+                              - light.turn_off: red_led
+                        - if:
+                            condition:
+                              lambda: return id(blue_led).remote_values.is_on();
+                            then:
+                              - light.turn_off: blue_led
+  - id: clear_protection_faults
+    then:
+      - lambda: |-
+          id(overcurrent_fault) = false;
+          id(overvoltage_fault) = false;
+          id(undervoltage_fault) = false;
+          id(overpower_fault) = false;
+          id(overheating_fault) = false;
+          id(overcurrent_problem).publish_state(false);
+          id(overvoltage_problem).publish_state(false);
+          id(undervoltage_problem).publish_state(false);
+          id(overpower_problem).publish_state(false);
+          id(overheating_problem).publish_state(false);
+      - script.execute: update_status_led
+
+switch:
+  - platform: gpio
+    id: outlet
+    name: Outlet
+    pin: GPIO32
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - lambda: |-
+          id(outlet_last_state) = true;
+          id(relay_on_started_ms) = millis();
+          id(relay_on_timer_active) = true;
+          id(lifetime_relay_cycles_count)++;
+          id(lifetime_relay_cycles).publish_state(id(lifetime_relay_cycles_count));
+      - script.execute: clear_protection_faults
+      - if:
+          condition:
+            switch.is_on: auto_off_timer
+          then:
+            - script.execute: auto_off_countdown
+    on_turn_off:
+      - script.stop: auto_off_countdown
+      - lambda: |-
+          id(outlet_last_state) = false;
+          if (id(relay_on_timer_active)) {
+            id(lifetime_relay_on_seconds) += (millis() - id(relay_on_started_ms)) / 1000;
+            id(relay_on_timer_active) = false;
+            id(lifetime_relay_on_time).publish_state(id(lifetime_relay_on_seconds) / 3600.0);
+          }
+          id(lifetime_relay_cycles_count)++;
+          id(lifetime_relay_cycles).publish_state(id(lifetime_relay_cycles_count));
+      - if:
+          condition:
+            lambda: return !id(protection_shutdown);
+          then:
+            - script.execute: clear_protection_faults
+          else:
+            - if:
+                condition:
+                  switch.is_on: automatic_fault_reset_enabled
+                then:
+                  - script.execute: automatic_fault_reset
+            - lambda: id(protection_shutdown) = false;
+  - platform: template
+    id: led_enabled
+    name: LED Enabled
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    on_turn_on:
+      - script.execute: update_status_led
+    on_turn_off:
+      - script.execute: update_status_led
+  - platform: template
+    id: standby_led
+    name: Standby LED
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+    on_turn_on:
+      - script.execute: update_status_led
+    on_turn_off:
+      - script.execute: update_status_led
+  - platform: template
+    id: button_lock
+    name: Button Lock
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+  - platform: template
+    id: automatic_fault_reset_enabled
+    name: Automatic Fault Reset
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+    on_turn_off:
+      - script.stop: automatic_fault_reset
+  - platform: template
+    id: auto_off_timer
+    name: Auto Off Timer
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+    on_turn_on:
+      - if:
+          condition:
+            switch.is_on: outlet
+          then:
+            - script.execute: auto_off_countdown
+    on_turn_off:
+      - script.stop: auto_off_countdown
+
+select:
+  - platform: template
+    id: power_on_behavior
+    name: Power On Behavior
+    entity_category: config
+    options:
+      - Always Off
+      - Always On
+      - Restore Last State
+    initial_option: Restore Last State
+    restore_value: true
+    optimistic: true
+
+binary_sensor:
+  - platform: template
+    id: overcurrent_problem
+    name: Overcurrent
+    device_class: problem
+    entity_category: diagnostic
+    lambda: return id(overcurrent_fault);
+  - platform: template
+    id: overvoltage_problem
+    name: Overvoltage
+    device_class: problem
+    entity_category: diagnostic
+    lambda: return id(overvoltage_fault);
+  - platform: template
+    id: undervoltage_problem
+    name: Undervoltage
+    device_class: problem
+    entity_category: diagnostic
+    lambda: return id(undervoltage_fault);
+  - platform: template
+    id: overpower_problem
+    name: Overpower
+    device_class: problem
+    entity_category: diagnostic
+    lambda: return id(overpower_fault);
+  - platform: template
+    id: overheating_problem
+    name: Overheating
+    device_class: problem
+    entity_category: diagnostic
+    lambda: return id(overheating_fault);
+  - platform: gpio
+    name: Button
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+    on_press:
+      - lambda: |-
+          id(lifetime_button_presses_count)++;
+          id(lifetime_button_presses).publish_state(id(lifetime_button_presses_count));
+      - if:
+          condition:
+            switch.is_off: button_lock
+          then:
+            - switch.toggle: outlet
+          else:
+            - script.execute: button_lock_feedback
+    filters:
+      - delayed_on_off: 5ms
+
+# Both LEDs are active-low; GPIO26 is red and GPIO33 is blue.
+output:
+  - platform: ledc
+    id: led_gpio26
+    pin:
+      number: GPIO26
+      inverted: true
+    frequency: 1kHz
+  - platform: ledc
+    id: led_gpio33
+    pin:
+      number: GPIO33
+      inverted: true
+    frequency: 1kHz
+
+light:
+  - platform: monochromatic
+    id: red_led
+    name: Red LED
+    output: led_gpio26
+    internal: true
+    default_transition_length: 0s
+  - platform: monochromatic
+    id: blue_led
+    name: Blue LED
+    output: led_gpio33
+    internal: true
+    default_transition_length: 0s
+
+sensor:
+  - platform: wifi_signal # Reports the WiFi signal strength/RSSI in dB
+    name: "WiFi Signal"
+    id: wifi_signal
+    update_interval: 60s
+    entity_category: "diagnostic"
+  - platform: hlw8012
+    model: BL0937
+    # 2351 * 119.65 / 132.6; measured at this plug's outlet.
+    voltage_divider: ${voltage_divider}
+    # Calibrated against the stock plug's 0.90 A reading.
+    current_resistor: ${current_resistor}
+    cf_pin: GPIO27
+    cf1_pin: GPIO14
+    sel_pin:
+      number: GPIO12
+      inverted: true
+    voltage:
+      id: outlet_voltage
+      name: Voltage
+      filters:
+        - delta: 0.1
+        - sliding_window_moving_average:
+            window_size: 4
+            send_every: 2
+            send_first_at: 1
+      on_raw_value:
+        then:
+          - lambda: |-
+              if (x > id(peak_voltage_v)) {
+                id(peak_voltage_v) = x;
+                id(peak_voltage).publish_state(x);
+              }
+              if (id(minimum_voltage_v) == 0.0f || x < id(minimum_voltage_v)) {
+                id(minimum_voltage_v) = x;
+                id(minimum_voltage).publish_state(x);
+              }
+              if (id(outlet).state && !id(overvoltage_fault) && x >= id(overvoltage_limit).state) {
+                id(overvoltage_fault) = true;
+                id(overvoltage_trips_count)++;
+                id(overvoltage_problem).publish_state(true);
+                id(overvoltage_trips).publish_state(id(overvoltage_trips_count));
+                id(record_trip)->execute("Overvoltage", x, "V");
+                id(protection_shutdown) = true;
+                id(outlet).turn_off();
+              }
+              if (id(outlet).state && !id(undervoltage_fault) && x <= id(undervoltage_limit).state) {
+                id(undervoltage_fault) = true;
+                id(undervoltage_trips_count)++;
+                id(undervoltage_problem).publish_state(true);
+                id(undervoltage_trips).publish_state(id(undervoltage_trips_count));
+                id(record_trip)->execute("Undervoltage", x, "V");
+                id(protection_shutdown) = true;
+                id(outlet).turn_off();
+              }
+          - script.execute: update_status_led
+          - script.execute: update_power_factor
+    current:
+      id: outlet_current
+      name: Current
+      filters:
+        - delta: 0.02
+        - sliding_window_moving_average:
+            window_size: 2
+            send_every: 2
+            send_first_at: 1
+      on_raw_value:
+        then:
+          - lambda: |-
+              if (x > id(peak_current_a)) {
+                id(peak_current_a) = x;
+                id(peak_current).publish_state(x);
+              }
+              if (id(outlet).state && !id(overcurrent_fault) && x >= id(overcurrent_limit).state) {
+                id(overcurrent_fault) = true;
+                id(overcurrent_trips_count)++;
+                id(overcurrent_problem).publish_state(true);
+                id(overcurrent_trips).publish_state(id(overcurrent_trips_count));
+                id(record_trip)->execute("Overcurrent", x, "A");
+                id(protection_shutdown) = true;
+                id(outlet).turn_off();
+              }
+          - script.execute: update_status_led
+          - script.execute: update_power_factor
+    power:
+      id: outlet_power
+      name: Power
+      # Calibrated against the stock plug's 108 W reading.
+      filters:
+        - multiply: ${power_calibration}
+        - sliding_window_moving_average:
+            window_size: 4
+            send_every: 2
+            send_first_at: 1
+        - delta: 0.2
+      on_raw_value:
+        then:
+          - lambda: |-
+              const float calibrated_power = x * ${power_calibration};
+              if (calibrated_power > id(peak_power_w)) {
+                id(peak_power_w) = calibrated_power;
+                id(peak_power).publish_state(calibrated_power);
+              }
+              if (id(outlet).state && !id(overpower_fault) && calibrated_power >= id(overpower_limit).state) {
+                id(overpower_fault) = true;
+                id(overpower_trips_count)++;
+                id(overpower_problem).publish_state(true);
+                id(overpower_trips).publish_state(id(overpower_trips_count));
+                id(record_trip)->execute("Overpower", calibrated_power, "W");
+                id(protection_shutdown) = true;
+                id(outlet).turn_off();
+              }
+          - script.execute: update_status_led
+          - script.execute: update_power_factor
+    energy:
+      id: bl0937_energy_since_boot
+      internal: true
+      on_value:
+        then:
+          - lambda: |-
+              const float delta_wh = x - id(energy_since_boot_wh);
+              if (delta_wh >= 0.0f) {
+                // Match the power sensor's calibration filter.
+                id(lifetime_energy_kwh) += (delta_wh * ${power_calibration}) / 1000.0;
+                id(lifetime_energy).publish_state(id(lifetime_energy_kwh));
+              }
+              id(energy_since_boot_wh) = x;
+    change_mode_every: 1
+    update_interval: 1s
+
+  - platform: template
+    id: lifetime_energy
+    name: Lifetime Energy
+    entity_category: diagnostic
+    device_class: energy
+    state_class: total_increasing
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    filters:
+      - delta: 0.001
+    lambda: return id(lifetime_energy_kwh);
+
+  - platform: template
+    id: lifetime_relay_on_time
+    name: Lifetime Relay On Time
+    entity_category: diagnostic
+    device_class: duration
+    state_class: total_increasing
+    unit_of_measurement: h
+    accuracy_decimals: 3
+    filters:
+      - delta: 0.05
+    lambda: |-
+      const float current_on_seconds = id(relay_on_timer_active) ? (millis() - id(relay_on_started_ms)) / 1000.0f : 0.0f;
+      return (id(lifetime_relay_on_seconds) + current_on_seconds) / 3600.0f;
+  - platform: template
+    id: lifetime_relay_cycles
+    name: Lifetime Relay Cycles
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    lambda: return id(lifetime_relay_cycles_count);
+    icon: "mdi:restart"
+  - platform: template
+    id: lifetime_button_presses
+    name: Lifetime Button Presses
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    lambda: return id(lifetime_button_presses_count);
+    icon: "mdi:gesture-tap-button"
+  - platform: template
+    id: peak_power
+    name: Peak Power
+    entity_category: diagnostic
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: W
+    accuracy_decimals: 1
+    filters:
+      - delta: 0.2
+    lambda: return id(peak_power_w);
+  - platform: template
+    id: peak_current
+    name: Peak Current
+    entity_category: diagnostic
+    device_class: current
+    state_class: measurement
+    unit_of_measurement: A
+    accuracy_decimals: 2
+    filters:
+      - delta: 0.02
+    lambda: return id(peak_current_a);
+  - platform: template
+    id: peak_voltage
+    name: Peak Voltage
+    entity_category: diagnostic
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: V
+    accuracy_decimals: 1
+    filters:
+      - delta: 0.1
+    lambda: return id(peak_voltage_v);
+  - platform: template
+    id: minimum_voltage
+    name: Minimum Voltage
+    entity_category: diagnostic
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: V
+    accuracy_decimals: 1
+    filters:
+      - delta: 0.1
+    lambda: return id(minimum_voltage_v);
+  - platform: template
+    id: peak_internal_temperature
+    name: Peak Internal Temperature
+    entity_category: diagnostic
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: °C
+    accuracy_decimals: 1
+    filters:
+      - delta: 0.1
+    lambda: return id(peak_internal_temperature_c);
+  - platform: template
+    id: overcurrent_trips
+    name: Overcurrent Trips
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    lambda: return id(overcurrent_trips_count);
+    icon: "mdi:flash-alert"
+  - platform: template
+    id: overvoltage_trips
+    name: Overvoltage Trips
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    lambda: return id(overvoltage_trips_count);
+    icon: "mdi:flash-alert"
+  - platform: template
+    id: undervoltage_trips
+    name: Undervoltage Trips
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    lambda: return id(undervoltage_trips_count);
+    icon: "mdi:flash-alert"
+  - platform: template
+    id: overpower_trips
+    name: Overpower Trips
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    lambda: return id(overpower_trips_count);
+    icon: "mdi:flash-alert"
+  - platform: template
+    id: overtemperature_trips
+    name: Overheating Trips
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    lambda: return id(overtemperature_trips_count);
+    icon: "mdi:thermometer-alert"
+
+  - platform: template
+    id: apparent_power
+    name: Apparent Power
+    device_class: apparent_power
+    unit_of_measurement: VA
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - delta: 0.2
+  - platform: template
+    id: power_factor
+    name: Power Factor
+    device_class: power_factor
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+    filters:
+      - delta: 0.01
+
+  - platform: adc
+    id: ntc_voltage
+    pin: GPIO34
+    attenuation: auto
+    update_interval: 1s
+    internal: true
+  - platform: resistance
+    id: ntc_resistance
+    sensor: ntc_voltage
+    configuration: DOWNSTREAM
+    resistor: 10kOhm
+    internal: true
+  - platform: ntc
+    id: ntc_internal_temperature
+    name: Internal Temperature
+    entity_category: diagnostic
+    sensor: ntc_resistance
+    filters:
+      - delta: 0.5
+      - sliding_window_moving_average:
+          window_size: 4
+          send_every: 2
+          send_first_at: 1
+    calibration:
+      b_constant: 3950
+      reference_temperature: 25°C
+      reference_resistance: 10kOhm
+    on_raw_value:
+      then:
+        - lambda: |-
+            if (x > id(peak_internal_temperature_c)) {
+              id(peak_internal_temperature_c) = x;
+              id(peak_internal_temperature).publish_state(x);
+            }
+            if (id(outlet).state && !id(overheating_fault) && x >= id(overheating_limit).state) {
+              id(overheating_fault) = true;
+              id(overtemperature_trips_count)++;
+              id(overheating_problem).publish_state(true);
+              id(overtemperature_trips).publish_state(id(overtemperature_trips_count));
+              id(record_trip)->execute("Overheating", x, "°C");
+              id(protection_shutdown) = true;
+              id(outlet).turn_off();
+            }
+        - script.execute: update_status_led
+
+text_sensor:
+  - platform: template
+    id: last_trip_reason
+    name: Last Trip Reason
+    entity_category: diagnostic
+    lambda: return id(last_trip_reason_value);
+    icon: "mdi:alert"
+
+button:
+  - platform: template
+    name: Reset Extrema
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(peak_power_w) = 0.0f;
+          id(peak_current_a) = 0.0f;
+          id(peak_voltage_v) = 0.0f;
+          id(minimum_voltage_v) = 0.0f;
+          id(peak_internal_temperature_c) = 0.0f;
+          id(peak_power).publish_state(0.0f);
+          id(peak_current).publish_state(0.0f);
+          id(peak_voltage).publish_state(0.0f);
+          id(minimum_voltage).publish_state(0.0f);
+          id(peak_internal_temperature).publish_state(0.0f);
+    icon: "mdi:autorenew"
+  - platform: template
+    name: Reset Trips
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(overcurrent_trips_count) = 0;
+          id(overvoltage_trips_count) = 0;
+          id(undervoltage_trips_count) = 0;
+          id(overpower_trips_count) = 0;
+          id(overtemperature_trips_count) = 0;
+          id(overcurrent_trips).publish_state(0);
+          id(overvoltage_trips).publish_state(0);
+          id(undervoltage_trips).publish_state(0);
+          id(overpower_trips).publish_state(0);
+          id(overtemperature_trips).publish_state(0);
+          id(last_trip_reason_value) = "None";
+          id(last_trip_reason).publish_state("None");
+    icon: "mdi:autorenew"
+  - platform: template
+    name: Reset Relay Statistics
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(lifetime_relay_on_seconds) = 0;
+          id(relay_on_started_ms) = millis();
+          id(lifetime_relay_cycles_count) = 0;
+          id(lifetime_relay_on_time).publish_state(0.0f);
+          id(lifetime_relay_cycles).publish_state(0);
+    icon: "mdi:autorenew"
+  - platform: template
+    name: Reset Button Statistics
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(lifetime_button_presses_count) = 0;
+          id(lifetime_button_presses).publish_state(0);
+    icon: "mdi:autorenew"
+  - platform: template
+    name: Reset Lifetime Energy
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(lifetime_energy_kwh) = 0.0;
+          id(energy_since_boot_wh) = id(bl0937_energy_since_boot).get_state();
+          id(lifetime_energy).publish_state(0.0);
+
+    icon: "mdi:autorenew"
+number:
+  - platform: template
+    id: blue_led_brightness
+    name: Blue LED Brightness
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 1
+    max_value: 100
+    step: 1
+    initial_value: 100
+    restore_value: true
+    optimistic: true
+    set_action:
+      - if:
+          condition:
+            lambda: return id(outlet).state && id(blue_led).remote_values.is_on();
+          then:
+            - light.turn_on:
+                id: blue_led
+                brightness: !lambda return x / 100.0f;
+    icon: "mdi:led-on"
+  - platform: template
+    id: standby_led_brightness
+    name: Standby LED Brightness
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 1
+    max_value: 100
+    step: 1
+    initial_value: 30
+    restore_value: true
+    optimistic: true
+    set_action:
+      - if:
+          condition:
+            lambda: return !id(outlet).state && id(blue_led).remote_values.is_on();
+          then:
+            - light.turn_on:
+                id: blue_led
+                brightness: !lambda return x / 100.0f;
+    icon: "mdi:led-off"
+  - platform: template
+    id: overcurrent_limit
+    name: Overcurrent Limit
+    entity_category: config
+    device_class: current
+    unit_of_measurement: A
+    min_value: 1
+    max_value: 16
+    step: 0.1
+    initial_value: 16
+    restore_value: true
+    optimistic: true
+  - platform: template
+    id: overvoltage_limit
+    name: Overvoltage Limit
+    entity_category: config
+    device_class: voltage
+    unit_of_measurement: V
+    min_value: 1
+    max_value: 280
+    step: 1
+    initial_value: 280
+    restore_value: true
+    optimistic: true
+  - platform: template
+    id: undervoltage_limit
+    name: Undervoltage Limit
+    entity_category: config
+    device_class: voltage
+    unit_of_measurement: V
+    min_value: 1
+    max_value: 280
+    step: 1
+    initial_value: 1
+    restore_value: true
+    optimistic: true
+  - platform: template
+    id: overpower_limit
+    name: Overpower Limit
+    entity_category: config
+    device_class: power
+    unit_of_measurement: W
+    min_value: 1
+    max_value: 4480
+    step: 1
+    initial_value: 4480
+    restore_value: true
+    optimistic: true
+  - platform: template
+    id: overheating_limit
+    name: Overheating Limit
+    entity_category: config
+    device_class: temperature
+    unit_of_measurement: °C
+    min_value: 1
+    max_value: 95
+    step: 1
+    initial_value: 95
+    restore_value: true
+    optimistic: true
+  - platform: template
+    id: fault_reset_delay
+    name: Fault Reset Delay
+    entity_category: config
+    device_class: duration
+    unit_of_measurement: min
+    min_value: 10
+    max_value: 1440
+    step: 1
+    initial_value: 60
+    restore_value: true
+    optimistic: true
+  - platform: template
+    id: auto_off_delay
+    name: Auto Off Delay
+    entity_category: config
+    device_class: duration
+    unit_of_measurement: min
+    min_value: 1
+    max_value: 1440
+    step: 1
+    initial_value: 60
+    restore_value: true
+    optimistic: true
+    set_action:
+      - if:
+          condition:
+            lambda: return id(auto_off_timer).state && id(outlet).state;
+          then:
+            - script.execute: auto_off_countdown
+
+interval:
+  - interval: 1min
+    then:
+      - if:
+          condition:
+            lambda: return id(relay_on_timer_active);
+          then:
+            - lambda: |-
+                id(lifetime_relay_on_seconds) += (millis() - id(relay_on_started_ms)) / 1000;
+                id(relay_on_started_ms) = millis();
+                id(lifetime_relay_on_time).publish_state(id(lifetime_relay_on_seconds) / 3600.0);

@@ -1,0 +1,41 @@
+# Copy this file into ESPHome Builder before flashing the Shelly ZIP.
+# Change hostname in Builder after updating bootloader if more than one Plug US will be on a network.
+
+packages:
+  hardware:
+    url: https://github.com/inventor7777/ESPHome-Shelly-Plus-Plug-US
+    files:
+      - shelly-plus-plug-us-package.yaml
+    ref: main
+    refresh: 1d
+
+esphome:
+  name: shelly-plus-plug-us
+  friendly_name: Shelly Plus Plug US
+  project:
+    name: inventor7777.shelly_plus_plug_us
+    version: "1.0.0"
+
+esp32_improv:
+  authorizer: none
+
+time:
+  - platform: sntp
+    id: sntp_time
+  
+logger:
+
+# Deliberately unencrypted for the public bootstrap image. It lets Builder
+# connect after Wi-Fi provisioning and perform the OTA bootloader update.
+api:
+
+ota:
+  - platform: esphome
+    allow_partition_access: true
+
+# Captive Portal and Improv save the entered station credentials in NVS.
+# No home SSID or password is stored in this repository or release image.
+wifi:
+  ap: {}
+
+captive_portal:
