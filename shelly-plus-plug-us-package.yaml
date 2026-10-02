@@ -593,7 +593,6 @@ sensor:
   - platform: template
     id: lifetime_energy
     name: Lifetime Energy
-    entity_category: diagnostic
     device_class: energy
     state_class: total_increasing
     unit_of_measurement: kWh
