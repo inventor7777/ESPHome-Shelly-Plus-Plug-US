@@ -25,6 +25,9 @@ esp32:
   framework:
     type: esp-idf
 
+ota:
+    allow_partition_access: true
+
 substitutions:
   voltage_divider: "2121.4"
   # 0.0012184 * (0.88 A / 0.90 A)
