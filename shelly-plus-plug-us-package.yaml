@@ -463,7 +463,7 @@ light:
 sensor:
   - platform: wifi_signal # Reports the WiFi signal strength/RSSI in dB
     name: "WiFi Signal"
-    id: wifi_signal
+    id: wifi_signal_sensor
     update_interval: 60s
     entity_category: "diagnostic"
   - platform: hlw8012
