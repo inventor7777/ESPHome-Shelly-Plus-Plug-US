@@ -19,6 +19,17 @@ After this, it becomes a normal ESPHome device, albeit with a Shelly partition t
 
 **NOTE:** Shelly's stock OS checks the firmware after upload to see if it is official. If it is not, the plug permanently and irreversibly burns eFuse BLOCK3 to indicate custom firmware and void your warranty.
 
+## Added features
+
+Compared with the stock user interface, the ESPHome package exposes these controls and diagnostics directly in Home Assistant:
+
+- Persistent lifetime energy, relay on-time, relay-cycle, and button-press counters.
+- Peak power, current, voltage, internal temperature, and minimum-voltage records.
+- Apparent power and power factor.
+- Configurable overcurrent, overvoltage, undervoltage, overpower, and overtemperature limits, with trip counters, last-trip reason, and optional automatic recovery.
+- Configurable power-on behavior, auto-off timer, button lock, and blue LED brightness for on and standby states.
+- Reset buttons for statistics, protection history, extrema, and lifetime energy.
+
 ## What is included
 
 - `Shelly-Plus-Plug-US-ESPHome-OTA.zip`: ready to upload through the stock Shelly web interface.
