@@ -54,3 +54,5 @@ The app image must fit Shelly's existing 1,638,400-byte OTA slot. While you coul
 - This project supports **only** the Plus Plug US model `SNPL-00116US`.
 - Metering and temperature values need validation against trusted reference instruments before using them as safety limits. The default calibrations worked on my Plug USes, but there is likely some variation between batches.
 - [Hardware and stock-firmware notes](Shelly-Plus-Plug-US-Hardware-and-Stock-Firmware-Notes.md) and the [detailed flash guide](Shelly-Plus-Plug-US-OTA-Flash-Guide.md) contain the technical records if you are interested.
+- The README and YAML was mostly written by me, partly by AI.
+- The investigation documents are written by AI, since it is more knowledgable about Ghidra and reversing firmware than me.
