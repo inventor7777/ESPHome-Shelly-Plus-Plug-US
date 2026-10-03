@@ -937,7 +937,7 @@ number:
     min_value: 1
     max_value: 280
     step: 1
-    initial_value: 1
+    initial_value: 90
     restore_value: true
     optimistic: true
   - platform: template
